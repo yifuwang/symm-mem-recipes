@@ -30,65 +30,81 @@ def gemv_all_reduce_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_N_RED: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    npids = tl.num_programs(0)
+    buffer_ptrs_ = buffer_ptrs.to(tl.pointer_type(tl.uint64))
 
-    n_start = pid * BLOCK_N
-    n_offsets = n_start + tl.arange(0, BLOCK_N)[:, None]
-    n_mask = n_offsets < N
-    acc = tl.zeros([BLOCK_N, BLOCK_K], tl.float32)
-    for k_start in range(0, K, BLOCK_K):
-        k_offsets = k_start + tl.arange(0, BLOCK_K)[None, :]
-        k_mask = k_offsets < K
-        a = tl.load(
-            x_ptr + (k_offsets), k_mask, eviction_policy="evict_last", other=0.0
-        ).to(tl.float32)
-        b = tl.load(
-            w_ptr + (k_offsets + (K * n_offsets)),
-            k_mask & n_mask,
-            eviction_policy="evict_first",
-            other=0.0,
-        ).to(tl.float32)
-        c = a * b
-        acc_ = acc + tl.broadcast_to(c, [BLOCK_N, BLOCK_K])
-        acc = tl.where(k_mask & n_mask, acc_, acc)
+    if tl.program_id(0) == 0:
+        buffer_ptr = tl.load(buffer_ptrs_ + rank).to(tl.pointer_type(tl.bfloat16))
 
-    acc = tl.sum(acc, 1)[:, None]
+        for red_block_id in tl.range(tl.cdiv(N, BLOCK_N_RED)):
+            val = tl.atomic_add(counter + red_block_id, 0)
+            while val != BLOCK_N_RED:
+                val = tl.atomic_add(counter + red_block_id, 0)
+            blockwise_barrier(signal_pad_ptrs, 0, rank, world_size)
 
-    # Broadcast the acc to all rank's workspace
-    buffer_ptrs = buffer_ptrs.to(tl.pointer_type(tl.uint64))
-    buffer_ptr = tl.load(buffer_ptrs + rank).to(tl.pointer_type(tl.bfloat16))
-    remote_buffer_ptrs = tl.load(buffer_ptrs + tl.arange(0, world_size)).to(
-        tl.pointer_type(tl.bfloat16)
-    )
-    tl.store(
-        n_offsets + rank * N + remote_buffer_ptrs[None, :],
-        acc.broadcast_to([BLOCK_N, world_size]),
-        n_mask,
-    )
+            n_start_ = red_block_id * BLOCK_N_RED
+            n_offsets_ = n_start_ + tl.arange(0, BLOCK_N_RED)
+            w_offsets = tl.arange(0, world_size)
+            block_offsets = w_offsets[:, None] * N + n_offsets_[None, :]
+            block = tl.load(buffer_ptr + block_offsets, n_offsets_[None, :] < N)
+            vec = tl.sum(block, 0)
+            tl.store(out_ptr + n_start_ + tl.arange(0, BLOCK_N_RED), vec, n_offsets_ < N)
+    else:
+        n_start = (tl.program_id(0) - 1) * BLOCK_N
+        n_offsets = n_start + tl.arange(0, BLOCK_N)[:, None]
+        n_mask = n_offsets < N
+        acc = tl.zeros([BLOCK_N, BLOCK_K], tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            k_offsets = k_start + tl.arange(0, BLOCK_K)[None, :]
+            k_mask = k_offsets < K
+            a = tl.load(
+                x_ptr + (k_offsets), k_mask, eviction_policy="evict_last", other=0.0
+            ).to(tl.float32)
+            b = tl.load(
+                w_ptr + (k_offsets + (K * n_offsets)),
+                k_mask & n_mask,
+                eviction_policy="evict_first",
+                other=0.0,
+            ).to(tl.float32)
+            c = a * b
+            acc_ = acc + tl.broadcast_to(c, [BLOCK_N, BLOCK_K])
+            acc = tl.where(k_mask & n_mask, acc_, acc)
+
+        acc = tl.sum(acc, 1)[:, None]
+
+        # Broadcast the acc to all rank's workspace
+        remote_buffer_ptrs = tl.load(buffer_ptrs_ + tl.arange(0, world_size)).to(
+            tl.pointer_type(tl.bfloat16)
+        )
+        tl.store(
+            n_offsets + rank * N + remote_buffer_ptrs[None, :],
+            acc.broadcast_to([BLOCK_N, world_size]),
+            n_mask,
+        )
+
+        tl.atomic_add(counter + n_start // BLOCK_N_RED, BLOCK_N, sem="release")
 
     # Report progress to the reduction blocks. Note that Triton already inserts
     # a bar.sync after the store. It establishes observation order between the
     # writes by this cta and the atomic add. Acquiring the atomic add would
     # make the writes visible.
-    tl.atomic_add(counter, 1, sem="release")
+    # tl.atomic_add(counter, 1, sem="release")
 
-    # The last N // BLOCK_N_RED blocks performs reduction
-    if pid >= npids - N // BLOCK_N_RED:
-        red_block_id = npids - pid - 1
+    # # The last N // BLOCK_N_RED blocks performs reduction
+    # if pid >= npids - N // BLOCK_N_RED:
+    #     red_block_id = npids - pid - 1
 
-        val = tl.atomic_add(counter, 0)
-        while val < npids:
-            val = tl.atomic_add(counter, 0)
-        blockwise_barrier(signal_pad_ptrs, red_block_id, rank, world_size)
+    #     val = tl.atomic_add(counter, 0)
+    #     while val < npids:
+    #         val = tl.atomic_add(counter, 0)
+    #     blockwise_barrier(signal_pad_ptrs, red_block_id, rank, world_size)
 
-        n_start_ = red_block_id * BLOCK_N_RED
-        n_offsets_ = n_start_ + tl.arange(0, BLOCK_N_RED)
-        w_offsets = tl.arange(0, world_size)
-        block_offsets = w_offsets[:, None] * N + n_offsets_[None, :]
-        block = tl.load(buffer_ptr + block_offsets, n_offsets_[None, :] < N)
-        vec = tl.sum(block, 0)
-        tl.store(out_ptr + n_start_ + tl.arange(0, BLOCK_N_RED), vec, n_offsets_ < N)
+    #     n_start_ = red_block_id * BLOCK_N_RED
+    #     n_offsets_ = n_start_ + tl.arange(0, BLOCK_N_RED)
+    #     w_offsets = tl.arange(0, world_size)
+    #     block_offsets = w_offsets[:, None] * N + n_offsets_[None, :]
+    #     block = tl.load(buffer_ptr + block_offsets, n_offsets_[None, :] < N)
+    #     vec = tl.sum(block, 0)
+    #     tl.store(out_ptr + n_start_ + tl.arange(0, BLOCK_N_RED), vec, n_offsets_ < N)
 
 
 ptx = None
@@ -98,8 +114,9 @@ def gemv_all_reduce(
     x: torch.Tensor, w: torch.Tensor, output: torch.Tensor, workspace: _SymmetricMemory
 ):
     N, K = w.shape[0], w.shape[1]
-    counter = torch.zeros(1, dtype=torch.uint32, device=x.device)
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)
+
+    counter = torch.zeros(N // 2048, dtype=torch.uint32, device=x.device)
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]) + 1,)
     compiled = gemv_all_reduce_kernel[grid](
         x,
         w,
@@ -154,7 +171,9 @@ if __name__ == "__main__":
     #     return output
 
     # print(fn())
-    # benchmark_with_profiler(lambda: fn(), "", benchmark_iters=200)
+    # lat_us = benchmark_with_profiler(lambda: fn(), "sm90", benchmark_iters=200)
+    # if rank == 0:
+    #     print(f"Median latency: {lat_us:.2f} us")
     # import sys
     # sys.exit(0)
     ########
