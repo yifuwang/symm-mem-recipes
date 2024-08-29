@@ -39,6 +39,7 @@ def get_flat_tid():
 @triton.jit
 def blockwise_barrier(
     signal_pad_ptrs,
+    block_id,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
@@ -77,11 +78,12 @@ def blockwise_barrier(
             acquire &signal_pad_ptrs[remote_rank][blockIdx.x * world_size + rank];
         }
     """
-    block_id = (
-        tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0)
-        + tl.program_id(1) * tl.num_programs(0)
-        + tl.program_id(0)
-    )
+    if block_id is None:
+        block_id = (
+            tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0)
+            + tl.program_id(1) * tl.num_programs(0)
+            + tl.program_id(0)
+        )
     flat_tid = get_flat_tid()
 
     remote_ranks = tl.arange(0, WORLD_SIZE)
@@ -146,7 +148,7 @@ def barrier_test_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
-    blockwise_barrier(signal_pad_ptrs, RANK, WORLD_SIZE)
+    blockwise_barrier(signal_pad_ptrs, None, RANK, WORLD_SIZE)
 
 
 def barrier_test(symm_mem: _SymmetricMemory):

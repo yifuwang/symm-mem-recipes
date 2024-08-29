@@ -1,7 +1,7 @@
+import re
 from contextlib import nullcontext
 from typing import Callable, List, Optional
 
-import re
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_utils import get_cycles_per_ms
@@ -76,7 +76,3 @@ def benchmark_with_profiler(
         return 0
 
     return torch.tensor(latencies_us).median().item()
-
-
-def get_triton_ptx(kernel):
-    return next(iter(kernel.cache[0].values())).asm["ptx"]

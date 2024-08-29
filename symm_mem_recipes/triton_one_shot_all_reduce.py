@@ -67,7 +67,7 @@ def one_shot_all_reduce_kernel(
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
 ):
-    blockwise_barrier(signal_pad_ptrs, rank, world_size)
+    blockwise_barrier(signal_pad_ptrs, None, rank, world_size)
     pid = tl.program_id(axis=0)
 
     buffer_ptrs = buffer_ptrs.to(tl.pointer_type(tl.uint64))
