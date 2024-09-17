@@ -160,6 +160,12 @@ def barrier_test(symm_mem: _SymmetricMemory):
 
 
 if __name__ == "__main__":
+    """
+    torchrun \
+    --nnodes 1 --nproc-per-node 8 \
+    --rdzv-backend c10d --rdzv-endpoint localhost:0 \
+    --no_python python3 -m symm_mem_recipes.triton_barrier
+    """
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
