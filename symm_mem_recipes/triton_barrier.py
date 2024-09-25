@@ -9,31 +9,42 @@ from torch.distributed._symmetric_memory import enable_symm_mem_for_group
 
 
 @triton.jit
-def get_flat_tid():
+def get_tid():
     return tl.inline_asm_elementwise(
         """
-        {
-            .reg .u32   %tmp32_<2>;
-
-            mov.u32     %tmp32_0, %tid.z;
-            mov.u32     %tmp32_1, %ntid.y;
-            mul.lo.u32  %tmp32_0, %tmp32_0, %tmp32_1; // tid.z * ntid.y
-            mov.u32     %tmp32_1, %ntid.x;
-            mul.lo.u32  $0, %tmp32_0, %tmp32_1;       // $0 = tid.z * ntid.y * ntid.x
-            mov.u32     %tmp32_0, %tid.y;
-            mov.u32     %tmp32_1, %ntid.x;
-            mul.lo.u32  %tmp32_0, %tmp32_0, %tmp32_1; // tid.y * ntid.x
-            add.u32     $0, $0, %tmp32_0;             // $0 += tid.y * ntid.x
-            mov.u32     %tmp32_0, %tid.x;
-            add.u32     $0, $0, %tmp32_0;             // $0 += tid.x
-        }
+        mov.u32 $0, %tid.x;
+        mov.u32 $1, %tid.y;
+        mov.u32 $2, %tid.z;
         """,
-        "=r",
+        "=r,=r,=r",
         [],
-        dtype=tl.int32,
+        dtype=(tl.uint32, tl.uint32, tl.uint32),
         is_pure=True,
         pack=1,
     )
+
+
+@triton.jit
+def get_ntid():
+    return tl.inline_asm_elementwise(
+        """
+        mov.u32 $0, %ntid.x;
+        mov.u32 $1, %ntid.y;
+        mov.u32 $2, %ntid.z;
+        """,
+        "=r,=r,=r",
+        [],
+        dtype=(tl.uint32, tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def get_flat_tid():
+    tid_x, tid_y, tid_z = get_tid()
+    ntid_x, ntid_y, _ = get_ntid()
+    return tid_z * ntid_y * ntid_x + tid_y * ntid_x + tid_x
 
 
 @triton.jit
