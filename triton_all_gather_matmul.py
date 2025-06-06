@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 import triton.tools.experimental_descriptor
 
-from triton_barrier import get_flat_tid
+from triton_barrier_local import wait_gmem_barrier
 from utils import benchmark_with_event, log_triton_kernel
 
 
@@ -64,30 +64,6 @@ def _matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
-@triton.jit
-def wait_signal(addr, flat_tid):
-    if flat_tid == 0:
-        tl.inline_asm_elementwise(
-            """
-            {
-                .reg .pred  %p<1>;
-
-                wait_block:
-                    ld.global.relaxed.gpu.u32 $0, [$1];
-                    setp.eq.u32 %p0, $0, 1;
-                    @!%p0 bra wait_block;
-            }
-            """,
-            "=r, l",
-            [addr],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-
-    tl.inline_asm_elementwise(
-        "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
-    )
 
 
 @triton.jit(launch_metadata=_matmul_launch_metadata)
@@ -113,7 +89,6 @@ def matmul_kernel_tma_persistent(
     """
     Slightly modified from the sm90 tma persistent Triton tutorial.
     """
-    flat_tid = get_flat_tid()
 
     dtype = tl.float8e4nv if FP8_OUTPUT else tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -164,7 +139,7 @@ def matmul_kernel_tma_persistent(
                 a_ptr = a_shard_desc_ptr
             else:
                 # Wait for and read from a_shard copied from remote ranks
-                wait_signal((progress_ptr + comm_block_id).to(tl.uint64), flat_tid)
+                wait_gmem_barrier(progress_ptr + comm_block_id)
                 offs_am_src = pid_m * BLOCK_SIZE_M
                 a_ptr = a_desc_ptr
 
