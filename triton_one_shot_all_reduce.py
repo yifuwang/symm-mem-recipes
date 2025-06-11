@@ -8,55 +8,9 @@ from triton_barrier import blockwise_barrier
 from triton_utils import sync_threads
 from utils import log_triton_kernel
 
-
-@triton.jit
-def load_128(addrs, mask):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .pred %p0;
-            setp.eq.s32             %p0, $3, 1;
-            @%p0 ld.global.v2.u64   {$0, $1}, [$2];
-        }
-        """,
-        "=l,=l,l,r",
-        args=[addrs, mask.to(tl.int32)],
-        dtype=(tl.uint64, tl.uint64),
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def add_v8_bf16(a_hi, a_lo, b_hi, b_lo):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .v4 .b32 %acc, %tmp;
-            mov.v4.b32  %acc, 0;
-            mov.b64     {%acc.x, %acc.y}, $2;
-            mov.b64     {%acc.z, %acc.w}, $3;
-            mov.b64     {%tmp.x, %tmp.y}, $4;
-            mov.b64     {%tmp.z, %tmp.w}, $5;
-            add.bf16x2  %acc.x, %acc.x, %tmp.x;
-            add.bf16x2  %acc.y, %acc.y, %tmp.y;
-            add.bf16x2  %acc.z, %acc.z, %tmp.z;
-            add.bf16x2  %acc.w, %acc.w, %tmp.w;
-            mov.b64     $0, {%acc.x, %acc.y};
-            mov.b64     $1, {%acc.z, %acc.w};
-        }
-        """,
-        "=l,=l,l,l,l,l",
-        args=[a_hi, a_lo, b_hi, b_lo],
-        dtype=(tl.uint64, tl.uint64),
-        is_pure=True,
-        pack=1,
-    )
-
-
 @triton.jit
 def one_shot_all_reduce_kernel(
-    buffer_ptrs,
+    buffer_ptr_addrs,
     signal_pad_ptrs,
     output_ptr,
     numel: tl.constexpr,
@@ -69,28 +23,31 @@ def one_shot_all_reduce_kernel(
     sync_threads()
 
     pid = tl.program_id(axis=0)
+    buffer_ptr_addrs = buffer_ptr_addrs.to(tl.pointer_type(tl.uint64))
+    output_ptr = output_ptr.to(tl.pointer_type(tl.bfloat16))
+    block_start = pid * BLOCK_SIZE * NUMEL_PER_THREAD
 
-    buffer_ptrs = buffer_ptrs.to(tl.pointer_type(tl.uint64))
-    output_ptr = output_ptr.to(tl.pointer_type(tl.uint64))
-    block_start = pid * BLOCK_SIZE
-
-    while block_start < (numel // NUMEL_PER_THREAD):
+    while block_start < numel:
         # Each thread processes 128 bits. Since Triton doesn't yet natively
         # support 128-bit dtypes, we achieve this by having each thread process
         # two 64-bit elements.
-        offsets = (block_start + tl.arange(0, BLOCK_SIZE)) * 2
-        mask = block_start + tl.arange(0, BLOCK_SIZE) < numel // NUMEL_PER_THREAD
 
-        acc_hi = tl.zeros((BLOCK_SIZE,), tl.uint64)
-        acc_lo = tl.zeros((BLOCK_SIZE,), tl.uint64)
+        # WHYY??
+        # Each thread processes 128 bits -> 8 x bf16 elements.
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE * NUMEL_PER_THREAD)
+        mask = offsets < numel
+
+        acc = tl.zeros((BLOCK_SIZE * NUMEL_PER_THREAD, ), dtype=tl.bfloat16)
         for i in range(world_size):
-            buffer_ptr = tl.load(buffer_ptrs + i).to(tl.pointer_type(tl.uint64))
-            (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
-            (acc_hi, acc_lo) = add_v8_bf16(acc_hi, acc_lo, hi, lo)
 
-        tl.store(output_ptr + offsets + 0, acc_hi, mask=mask)
-        tl.store(output_ptr + offsets + 1, acc_lo, mask=mask)
-        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+            buffer_ptr = tl.load(buffer_ptr_addrs + i).to(tl.pointer_type(tl.bfloat16))
+            tl.multiple_of(buffer_ptr, 16)
+            x = tl.load(buffer_ptr + offsets, mask=mask)
+            acc += x
+        tl.multiple_of(output_ptr, 16) # We're probably find without this.
+        tl.store(output_ptr + offsets, acc, mask=mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE * NUMEL_PER_THREAD
 
     sync_threads()
     blockwise_barrier(signal_pad_ptrs, None, rank, world_size, sem="relaxed")
@@ -98,7 +55,7 @@ def one_shot_all_reduce_kernel(
 
 def one_shot_all_reduce(tensor: torch.Tensor):
     MAX_NUM_BLOCKS = 24
-    NUM_WARPS = 16
+    NUM_WARPS = 32
     BLOCK_SIZE = NUM_WARPS * 32
     NUMEL_PER_THREAD = 8
 

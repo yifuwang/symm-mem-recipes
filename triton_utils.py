@@ -52,6 +52,4 @@ def get_flat_bid():
 
 @triton.jit
 def sync_threads():
-    tl.inline_asm_elementwise(
-        "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
-    )
+    tl.debug_barrier()
